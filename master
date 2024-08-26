@@ -1,0 +1,447 @@
+## SET UP ---------
+
+rm(list=ls())
+
+library(dplyr)
+library(readxl)
+library(caTools)
+library(ROCR) 
+library(caret)
+library(cowplot)
+library(mlbench)
+library(MASS)
+library(pROC)
+library(haven)
+library(rlang)
+library(conflicted)
+library(purrr)
+library(broom)
+library(tidyr)
+theme_set(theme_bw())
+
+# Declare conflicts and preferences
+
+conflict_prefer("select", "dplyr")
+
+# List paths
+
+path_project <- ""
+path_data <- ""
+
+## Link data --------------
+
+setwd(path_data)
+
+#Load data files
+
+data1 <- read_dta("Demographic_Background.dta") %>% # gender 1 male, 2 female
+  select(c(1,4,7,39, 17)) %>% # Select ID, gender and year of birth, education, location of residential address
+  set_names(c("id","gender","year_of_birth","education", "address_type")) %>% # Rename columns
+  mutate(age = 2018 - year_of_birth) %>% # Calculate age
+  select(-(year_of_birth)) %>% # Remove unused column
+  mutate()
+    
+data2 <- read_dta("Health_Status_and_Functioning.dta") %>% # smoking products da060,hypertension da011_w4_s1, Rx for stroke da019_w4_s1
+  select(c(1,365,155,229)) %>%
+  set_names(c("id", "smoker", "hypertension", "stroke")) %>%
+  mutate(smoker = if_else(!is.na(smoker), 1, 2)) %>% # 1 yes, 2 no
+  mutate(hypertension = if_else(!is.na(hypertension), 1, 2)) %>%
+  mutate(stroke = if_else(!is.na(stroke), 1, 2)) 
+
+data3 <- read_dta("Individual_Income.dta") %>%  # ga001: Receive Wage and Bonus Income
+  select(1,4) %>%
+  set_names(c("id", "wage_status")) # 1 yes, 2 no
+ 
+data4 <- read_dta("Work_Retirement.dta") %>% # supervise anyone fd015, fd002 type of eomplyer, fd020 contract, xf1 working, xf4 farm work, xf11 emplyed, self-emplyed non farm
+  select(1, 97, 84, 99, 285, 287, 286) %>%
+  set_names("id", "supervise", "employer_type", "work_contract", "worker", "farm_work", "employment_type_2") %>%
+  mutate(worker = if_else(worker == 3, 1, 2)) %>% #1 yes, 2 no
+  mutate(farm_work = if_else(!is.na(farm_work), 1, 2)) %>% # yes, 2 no
+  select(-(employment_type_2))
+
+
+# Merge
+
+alldata <- merge(data1, data2, by = "id") %>%
+  merge(data3, by = "id") %>%
+  merge(data4, by = "id")
+
+
+# Save
+
+setwd(path_project)
+write.csv(alldata, "alldata.csv", row.names = F)
+
+# Save removed data
+a <- data1 %>% full_join(data2, by = "id") %>% full_join(data3, by="id") %>% full_join(data4, by = "id")
+
+excluded <- anti_join(a, alldata, by = c("id" = "id"))
+
+write.csv(excluded, "excluded_data.csv", row.names = F)
+
+## Clean data -------
+
+rm(list=ls())
+
+data <- read.csv("alldata.csv") #19714 data points
+
+summary(data) # sex (NA0),age 18-118 years (NA316), address type (NA306); education (NA 0), supervise (NA14872), emplyer_type (NA14872), work_contract (NA14872), worker (NA1)
+
+data <- data[data$age >= 45, ] #45 records removed as age <40 years. 19523 remaining
+
+
+data <- data %>% mutate(agegroup = case_when(age >= 45  & age <= 54 ~ '1',
+                                             age >= 55  & age <= 64 ~ '2',
+                                             age >= 65  & age <= 74 ~ '3',
+                                             age >= 75 ~ '4')) # cut into age groups
+
+
+# Reassign educational status
+data <- data %>% mutate(education = case_when(education == 1 ~ '1',
+                                                    education == 2 ~ '2',
+                                                    education == 3 | education == 4  ~ '3',
+                                                    education == 5 | education == 6   ~ '4',
+                                                    education == 8 | education == 9 |education == 10 |education == 11 ~ '5')) 
+
+
+# Show distributions
+
+table(data$gender)
+table(data$agegroup)
+table(data$address_type)
+table(data$education)
+table(data$smoker)
+table(data$stroke)
+table(data$wage_status)
+table(data$supervise)
+table(data$employer_type)
+table(data$work_contract)
+table(data$worker)
+table(data$farm_work)
+
+
+# Filter incomplete data
+
+data.complete <- data[!is.na(data$agegroup)&!is.na(data$age)&!is.na(data$gender)&!is.na(data$address_type)&!is.na(data$education)&!is.na(data$wage_status)&!is.na(data$stroke)&!is.na(data$worker)&!is.na(data$farm_work),] 
+ 
+
+data.removed <- anti_join(data, data.complete, by = c("id" = "id")) # excluded rows (incomplete data)
+
+write.csv(data.complete,"final_data_included.csv", row.names = F)
+write.csv(data.removed,"final_data_excluded.csv", row.names = F)
+
+## COMPARE DISTRIBUTIONS IN INCLUDED VS. EXCLUDED DATA -------------
+
+# Count distributions in included vs excluded data 
+
+table(data.complete$gender)
+table(data.complete$agegroup)
+table(data.complete$address_type)
+table(data.complete$education)
+table(data.complete$smoker)
+table(data.complete$stroke)
+table(data.complete$wage_status)
+table(data.complete$worker)
+table(data.complete$farm_work)
+
+table(data.removed$gender)
+table(data.removed$agegroup)
+table(data.removed$address_type)
+table(data.removed$education)
+table(data.removed$smoker)
+table(data.removed$stroke)
+table(data.removed$wage_status)
+table(data.removed$worker)
+table(data.removed$farm_work)
+
+# Compare distributions between included and excluded data, repeated for each variable
+
+v1 <- as.data.frame(data.complete) %>% mutate(group = "Included") %>% rename(value = 1)
+v2 <- as.data.frame(data.removed) %>% mutate(group = "Excluded") %>% rename(value=1)
+v3 <- rbind(v1, v2)
+
+# Stroke
+total <- data.complete %>% nrow()
+numerator <- data.complete %>% dplyr::filter(stroke == 1) %>% nrow()
+print(paste0("Included data - stroke", ": ", numerator, " events out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+total <- data.removed %>% dplyr::filter(stroke == 1 | stroke == 2) %>% nrow()
+numerator <- data.removed %>% dplyr::filter(stroke == 1) %>% nrow()
+print(paste0("Excluded data - stroke", ": ", numerator, " events out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+contingency_table <- table(v3$group, v3$stroke)
+chisq.test(contingency_table)
+
+
+# Gender
+total <- data.complete %>% nrow()
+numerator <- data.complete %>% dplyr::filter(gender == 1) %>% nrow()
+print(paste0("Included data - gender", ": ", numerator, " males out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+total <- data.removed %>% dplyr::filter(gender == 1 | gender == 2) %>% nrow()
+numerator <- data.removed %>% dplyr::filter(gender == 1) %>% nrow()
+print(paste0("Excluded data - gender", ": ", numerator, " males out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+contingency_table <- table(v3$group, v3$gender)
+chisq.test(contingency_table)
+
+# Age group
+total <- data.complete %>% nrow()
+print("Age group - included")
+data.complete %>% group_by(agegroup) %>% summarise(count = n(), percentage = n() / nrow(data.complete) * 100)
+
+print("Age group - excluded")
+total_no_na <- data.removed %>% dplyr::filter(!is.na(agegroup)) %>% nrow() 
+data.removed %>% dplyr::filter(!is.na(agegroup)) %>% group_by(agegroup) %>% summarise(count = n(), percentage = n() / total_no_na * 100)
+
+contingency_table <- table(v3$group, v3$agegroup)
+chisq.test(contingency_table)
+
+# Address type
+total <- data.complete %>% nrow()
+print("Address type - included")
+data.complete %>% group_by(address_type) %>% summarise(count = n(), percentage = n() / nrow(data.complete) * 100)
+
+print("Address type - excluded")
+total_no_na <- data.removed %>% dplyr::filter(!is.na(address_type)) %>% nrow() 
+data.removed %>% dplyr::filter(!is.na(address_type)) %>% group_by(address_type) %>% summarise(count = n(), percentage = n() / total_no_na * 100)
+
+contingency_table <- table(v3$group, v3$address_type)
+chisq.test(contingency_table)
+
+# Education
+total <- data.complete %>% nrow()
+print("Education - included")
+data.complete %>% group_by(education) %>% summarise(count = n(), percentage = n() / nrow(data.complete) * 100)
+
+print("Education - excluded")
+total_no_na <- data.removed %>% dplyr::filter(!is.na(education)) %>% nrow() 
+data.removed %>% dplyr::filter(!is.na(education)) %>% group_by(education) %>% summarise(count = n(), percentage = n() / total_no_na * 100)
+
+contingency_table <- table(v3$group, v3$education)
+chisq.test(contingency_table)
+
+# Smoker
+total <- data.complete %>% nrow()
+numerator <- data.complete %>% dplyr::filter(smoker == 1) %>% nrow()
+print(paste0("Included data - smoker", ": ", numerator, " out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+total <- data.removed %>% dplyr::filter(smoker == 1 | smoker == 2) %>% nrow()
+numerator <- data.removed %>% dplyr::filter(smoker == 1) %>% nrow()
+print(paste0("Excluded data - smoker", ": ", numerator, " out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+contingency_table <- table(v3$group, v3$smoker)
+chisq.test(contingency_table)
+
+# Worker
+total <- data.complete %>% nrow()
+numerator <- data.complete %>% dplyr::filter(worker == 1) %>% nrow()
+print(paste0("Included data - worker", ": ", numerator, " out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+total <- data.removed %>% dplyr::filter(worker == 1 | worker == 2) %>% nrow()
+numerator <- data.removed %>% dplyr::filter(worker == 1) %>% nrow()
+print(paste0("Excluded data - worker", ": ", numerator, " out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+contingency_table <- table(v3$group, v3$worker)
+chisq.test(contingency_table)
+
+# Farm worker
+total <- data.complete %>% nrow()
+numerator <- data.complete %>% dplyr::filter(farm_work == 1) %>% nrow()
+print(paste0("Included data - farm worker", ": ", numerator, " out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+total <- data.removed %>% dplyr::filter(farm_work == 1 | farm_work == 2) %>% nrow()
+numerator <- data.removed %>% dplyr::filter(farm_work == 1) %>% nrow()
+print(paste0("Excluded data - farm worker", ": ", numerator, " out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+contingency_table <- table(v3$group, v3$farm_work)
+chisq.test(contingency_table)
+
+# Wage status
+total <- data.complete %>% nrow()
+numerator <- data.complete %>% dplyr::filter(wage_status == 1) %>% nrow()
+print(paste0("Included data - wage status", ": ", numerator, " out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+total <- data.removed %>% dplyr::filter(wage_status == 1 | wage_status == 2) %>% nrow()
+numerator <- data.removed %>% dplyr::filter(wage_status == 1) %>% nrow()
+print(paste0("Excluded data - wage status", ": ", numerator, " out of ", total, " people (", round(100*numerator/total,1), "%)"))
+
+contingency_table <- table(v3$group, v3$wage_status)
+chisq.test(contingency_table)
+
+
+
+# Univariate distributions of variables by stroke, repeated for each variable
+
+# Smoker
+
+  # Table
+data.complete %>% group_by(stroke, smoker) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() 
+
+  # P value
+chisq.test(table(data.complete$stroke, data.complete$smoker))$p.value
+
+# Gender
+
+data.complete %>% group_by(stroke, gender) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() 
+
+chisq.test(table(data.complete$stroke, data.complete$gender))$p.value
+
+# Age group
+
+data.complete %>% group_by(stroke, agegroup) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() 
+
+chisq.test(table(data.complete$stroke, data.complete$agegroup))$p.value
+
+# Address type
+
+data.complete %>% group_by(stroke, address_type) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() 
+
+chisq.test(table(data.complete$stroke, data.complete$address_type))$p.value
+
+# Education 
+
+data.complete %>% group_by(stroke, education) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() 
+
+chisq.test(table(data.complete$stroke, data.complete$education))$p.value
+
+# Wage status
+
+data.complete %>% group_by(stroke, wage_status) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() 
+
+chisq.test(table(data.complete$stroke, data.complete$wage_status))$p.value
+
+# Worker
+
+data.complete %>% group_by(stroke, worker) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() 
+
+chisq.test(table(data.complete$stroke, data.complete$worker))$p.value
+
+# Farm work
+
+data.complete %>% group_by(stroke, farm_work) %>%
+  summarise(n = n()) %>%
+  mutate(freq = n / sum(n)) %>%
+  ungroup() 
+
+chisq.test(table(data.complete$stroke, data.complete$farm_work))$p.value
+
+
+## LOGISTIC REGRESSION
+
+# Swap farm worker so "not a farm worker" is 1 (the reference group)
+
+data.complete <- data.complete %>%
+  mutate(farm_work = case_when(
+    farm_work == 1 ~ 2,
+    farm_work == 2 ~ 1
+  ))
+
+# Variables as ordinal factors
+dplyr::mutate(data.complete,  
+              agegroup = 
+                dplyr::recode_factor(agegroup,   
+                                     `1`="45-54y", `2`="55-64y",
+                                     `3`="65-74y", `4` = "75+",  
+                                     .ordered = FALSE)) -> data.complete
+
+
+dplyr::mutate(data.complete,  
+              address_type = 
+                dplyr::recode_factor(address_type,   
+                                     `1`="Urban", `2`="Mixed",
+                                     `3`="Rural", `4` = "Special",  
+                                     .ordered = FALSE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              education = 
+                dplyr::recode_factor(education,   
+                                     `1`="None formal", `2`="Primary unfinished",
+                                     `3`="Primary finished", `4` = "Secondary", `5` = "Tertiary",  
+                                     .ordered = FALSE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              stroke = 
+                dplyr::recode_factor(stroke,   
+                                     `1`="Stroke", `2`="No stroke",
+                                     .ordered = FALSE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              smoker = 
+                dplyr::recode_factor(smoker,   
+                                     `1`="Smoker", `2`="Non-smoker",
+                                     .ordered = FALSE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              gender = 
+                dplyr::recode_factor(gender,   
+                                     `1`="Male", `2`="Female",
+                                     .ordered = FALSE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              wage_status = 
+                dplyr::recode_factor(wage_status,   
+                                     `1`="Wage", `2`="No wage",
+                                     .ordered = FALSE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              worker = 
+                dplyr::recode_factor(worker,   
+                                     `1`="Worker", `2`="Non-worker",
+                                     .ordered = FALSE)) -> data.complete
+
+dplyr::mutate(data.complete,  
+              farm_work = 
+                dplyr::recode_factor(farm_work,   
+                                     `1`="No farm work", `2`="Farm work",
+                                     .ordered = FALSE)) -> data.complete
+
+# Drop unrequired variables
+data.complete <- data.complete %>%
+  select(-c(5:7,10:12))
+
+
+
+
+# Logistic regression https://towardsdatascience.com/implementing-binary-logistic-regression-in-r-7d802a9d98fe 
+
+# Ensure all cloumns are factors and binary transform the stroke column
+
+data.complete <- data.complete %>%
+  mutate(
+    gender = as.factor(gender),
+    education = as.factor(education),
+    address_type = as.factor(address_type),
+    stroke = ifelse(stroke == "No stroke", 0, 1),
+    wage_status = as.factor(wage_status),
+    worker = as.factor(worker),
+    farm_work = as.factor(farm_work),
+    agegroup = as.factor(agegroup)
+  )
+# Run regression and print output
+
+model <- glm(stroke ~ gender + education + address_type + wage_status + worker + farm_work + agegroup, data = data.complete, family = binomial)
+tidy_model <- tidy(model)
+print(tidy_model)
+exp(cbind(OR = coef(model), confint(model))) # calculate ORs and 95% CI
